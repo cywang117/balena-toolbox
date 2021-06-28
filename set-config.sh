@@ -2,37 +2,88 @@
 
 set -o errexit
 
-if [[ $# -lt 2 ]]; then
-    echo USAGE: set-host-config.sh DEVICE_UUID BALENA_API_KEY [CONFIG_VAR = BALENA_HOST_EXTLINUX_isolcpus]
+USAGE=$(cat <<-END
+    USAGE:
+        \n./set-config.sh DEVICE_UUID BALENA_API_KEY
+        \n\t-c|--config: \tConfig var to patch in balenaCloud. (Default: BALENA_HOST_EXTLINUX_isolcpus)
+        \n\t-b|--bool: \tSpecifies whether --config is a true/false config to ensure patch requests are accurate. (Default: false)
+    \nExamples:
+    \n\t./set-config.sh 1234567 myApiToken --config=RESIN_HOST_CONFIG_enable_uart -b
+END
+)
+
+DEVICE_UUID=$1
+BALENA_API_KEY=$2
+CONFIG=BALENA_HOST_EXTLINUX_isolcpus
+ISBOOL=false
+
+# Get flag opts (https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash)
+for i in "$@"; do
+    case $i in
+        -c=*|--config=*)
+            CONFIG="${i#*=}"
+            shift
+            ;;
+        -b|--bool)
+            ISBOOL=true
+            shift
+            ;;
+        *)
+            ;;
+    esac
+done
+
+# Validate required command line arguments
+if [[ -z "$DEVICE_UUID" || -z "$BALENA_API_KEY" ]]; then
+    echo -e '\nDEVICE_UUID and BALENA_API_KEY are required arguments.\n'
+    echo -e $USAGE
     exit 1;
 fi
 
-uuid=$1
-token=$2
-config_to_set=$([ $3 ] && echo $3 || echo BALENA_HOST_EXTLINUX_isolcpus)
+if [[ "${#DEVICE_UUID}" -ne 32 && "${#DEVICE_UUID}" -ne 7 ]]; then
+    echo -e "\nDEVICE_UUID must have length 32 (full uuid) or 7 (short uuid)."
+    echo -e $USAGE
+    exit 1;
+fi;
 
-echo "Updating boot config $config_to_set for device $uuid..."
+echo "Updating config $CONFIG for $DEVICE_UUID..."
 
-# Get device id based on device uuid
-device_id=$(curl "https://api.balena-cloud.com/v6/device?\$filter=startswith(uuid,'$uuid')&\$select=id" -X GET -H 'Accept: */*' --compressed --silent -H "authorization: Bearer $token" -H 'content-type: application/json' | jq '.d[0].id')
+# Get device id (unique database ID in backend) based on $DEVICE_UUID
+DEVICE_ID=$(
+    curl "https://api.balena-cloud.com/v6/device?\$filter=startswith(uuid,'$DEVICE_UUID')&\$select=id" \
+        -X GET --compressed --silent \
+        -H 'Accept: */*' \
+        -H "authorization: Bearer $BALENA_API_KEY" \
+        -H 'content-type: application/json' | jq '.d[0].id'
+)
 
-# Get config id & val of $config_to_set
-read config_id config_val < <(echo $(curl "https://api.balena-cloud.com/v6/device_config_variable?\$orderby=name%20asc&\$filter=device%20eq%20$device_id%20and%20name%20eq%20'$config_to_set'" -X GET -H 'Accept: */*' --compressed --silent -H "authorization: Bearer $token" -H 'content-type: application/json' | jq -r '.d[0].id, .d[0].value'))
+# Get config id & val of $CONFIG (database values)
+read CONFIG_ID CONFIG_VAL < <(echo $(
+    curl "https://api.balena-cloud.com/v6/device_config_variable?\$orderby=name%20asc&\$filter=device%20eq%20$DEVICE_ID%20and%20name%20eq%20'$CONFIG'" \
+    -X GET --compressed --silent \
+     -H 'Accept: */*' \
+     -H "authorization: Bearer $BALENA_API_KEY" \
+     -H 'content-type: application/json' | jq -r '.d[0].id, .d[0].value'
+))
 
-# Exit if config_id or config_val are empty
-if [[ $config_id == null || $config_val == null ]]; then 
-    echo "Cannot find $config_to_set for device $uuid, exiting."
+# Exit if CONFIG_ID or CONFIG_VAL are empty
+if [[ $CONFIG_ID == null || $CONFIG_VAL == null ]]; then 
+    echo -e "Cannot find $CONFIG for $DEVICE_UUID. Is this config valid for your device type?"
     exit 1;
 fi
 
-# TODO: Target values don't work for all host configs, works for BALENA_HOST_EXTLINUX_isolcpus at least
-target_val=$([ "$config_val" = 2 ] && echo "1" || echo "2" )
-echo "Current $config_to_set is $config_val, setting to $target_val..."
+# Target value must be 0 or 1 for true/false type configs
+if [[ $ISBOOL == true ]]; then
+    TARGET_VAL=$([ "$CONFIG_VAL" = 1 ] && echo "0" || echo "1" )
+else
+    TARGET_VAL=$([ "$CONFIG_VAL" = 2 ] && echo "1" || echo "2" )
+fi
+echo "Current $CONFIG is $CONFIG_VAL, setting to $TARGET_VAL..."
 
-curl "https://api.balena-cloud.com/v6/device_config_variable($config_id)" -X PATCH \
-    -H 'Accept: */*' -H "authorization: Bearer $token" \
+# Patch config
+curl "https://api.balena-cloud.com/v6/device_config_variable($CONFIG_ID)" -X PATCH \
+    -H 'Accept: */*' -H "authorization: Bearer $BALENA_API_KEY" \
     -H 'content-type: application/json' \
-    --compressed --silent --data-raw "{\"value\":\"$target_val\"}"
+    --compressed --silent --data-raw "{\"value\":\"$TARGET_VAL\"}"
 
-echo -e "Value patched, exiting."
 exit 0;
